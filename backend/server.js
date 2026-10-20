@@ -8,9 +8,12 @@ import nodemailer from 'nodemailer';
 import { OAuth2Client } from 'google-auth-library';
 import argon2 from 'argon2';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const app = express();
 const port = Number(process.env.PORT || 8000);
+const frontendDir = resolve(dirname(fileURLToPath(import.meta.url)), '../dist');
 const dsn = Object.fromEntries((process.env.DB_DSN || '').replace(/^mysql:/, '').split(';').map(s => s.split('=').map(x => x.trim())).filter(x => x.length === 2));
 const pool = mysql.createPool({ host: dsn.host || process.env.DB_HOST || '127.0.0.1', port: Number(dsn.port || process.env.DB_PORT || 3306), database: dsn.dbname || process.env.DB_NAME || 'unique_write', user: process.env.DB_USER || 'unique_write', password: process.env.DB_PASS || '', waitForConnections: true, connectionLimit: 10, timezone: 'Z', decimalNumbers: true, charset: 'utf8mb4' });
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
@@ -182,6 +185,8 @@ app.patch(/^\/api\/admin\/(creators|hooks|campaign-links)(?:\/(\d+))?$/, auth, a
 
 app.use((err, _req, res, _next) => { console.error('api_error', err.code || err.name); if (err.status) return jsonError(res, err.status, err.code || 'ERROR', err.message, err.extra); if (err.code === 'ER_DUP_ENTRY') return jsonError(res, 409, 'CONFLICT', 'Record already exists.'); jsonError(res, 500, 'INTERNAL_ERROR', 'Something went wrong. Please try again.'); });
 app.use('/api', (_req,res)=>jsonError(res,404,'NOT_FOUND','Not found.'));
+app.use(express.static(frontendDir));
+app.get(/.*/, (_req, res, next) => res.sendFile(resolve(frontendDir, 'index.html'), error => { if (error) next(error); }));
 app.listen(port, '0.0.0.0', () => console.log(`Node API listening on :${port}`));
 
 function oauthClient() { if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) throw fail(503,'OAUTH_UNAVAILABLE','Google OAuth is not configured.'); return new OAuth2Client(process.env.GOOGLE_CLIENT_ID,process.env.GOOGLE_CLIENT_SECRET,`${(process.env.APP_URL||'').replace(/\/$/,'')}/api/auth/google/callback`); }
