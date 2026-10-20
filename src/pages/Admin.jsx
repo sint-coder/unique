@@ -9,10 +9,39 @@ const emptyForm = {
 const labels = { creators: 'Creators', hooks: 'Hooks', 'campaign-links': 'Campaign links' };
 const today = () => new Date().toISOString().slice(0, 10);
 const daysAgo = (days) => { const date = new Date(); date.setUTCDate(date.getUTCDate() - days); return date.toISOString().slice(0, 10); };
+const trendMetrics = {
+  visitors: { label: 'Visitors', color: '#2563eb' },
+  signups: { label: 'Registrations', color: '#7c3aed' },
+  humanized: { label: 'Used humanizer', color: '#059669' },
+  purchaseClicks: { label: 'Purchase clicks', color: '#ea580c' },
+  paidUsers: { label: 'Paying users', color: '#db2777' },
+  revenue: { label: 'Revenue', color: '#0891b2' },
+};
+
+function TrendChart({ title, series, metrics, currency = false }) {
+  const width = 760, height = 250, left = 46, right = 14, top = 18, bottom = 34;
+  const values = series.flatMap((point) => metrics.map((key) => Number(point[key] || 0)));
+  const max = Math.max(1, ...values), xAt = (index) => left + (series.length < 2 ? 0 : index / (series.length - 1)) * (width - left - right);
+  const yAt = (value) => top + (1 - value / max) * (height - top - bottom);
+  const dateLabel = (value) => new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(new Date(`${value}T00:00:00Z`));
+  const labelIndexes = [...new Set([0, Math.floor((series.length - 1) / 2), series.length - 1])];
+  return <article className="card min-w-0">
+    <h3 className="mb-3 text-base font-semibold">{title}</h3>
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-2">{metrics.map((key) => <span key={key} className="inline-flex items-center gap-2 text-xs text-zinc-600"><i className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: trendMetrics[key].color }} />{trendMetrics[key].label}</span>)}</div>
+    <div className="w-full overflow-hidden">
+      <svg className="h-56 w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title} preserveAspectRatio="none">
+        {[0, 0.5, 1].map((fraction) => { const y = top + fraction * (height - top - bottom); return <g key={fraction}><line x1={left} x2={width - right} y1={y} y2={y} stroke="#e4e4e7" strokeDasharray="4 4" /><text x={left - 8} y={y + 4} textAnchor="end" fill="#71717a" fontSize="11">{currency ? `$${(max * (1 - fraction)).toFixed(max >= 100 ? 0 : 2)}` : Math.round(max * (1 - fraction))}</text></g>; })}
+        {metrics.map((key) => <polyline key={key} fill="none" stroke={trendMetrics[key].color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" points={series.map((point, index) => `${xAt(index)},${yAt(Number(point[key] || 0))}`).join(' ')} />)}
+        {labelIndexes.map((index) => <text key={index} x={xAt(index)} y={height - 8} textAnchor={index === 0 ? 'start' : index === series.length - 1 ? 'end' : 'middle'} fill="#71717a" fontSize="11">{series[index] ? dateLabel(series[index].date) : ''}</text>)}
+      </svg>
+    </div>
+  </article>;
+}
 
 export default function Admin({ user }) {
   const [stats, setStats] = useState(null);
   const [funnel, setFunnel] = useState(null);
+  const [trends, setTrends] = useState([]);
   const [campaigns, setCampaigns] = useState([]);
   const [records, setRecords] = useState({ creators: [], hooks: [], 'campaign-links': [] });
   const [kind, setKind] = useState('creators');
@@ -20,6 +49,7 @@ export default function Admin({ user }) {
   const [editingId, setEditingId] = useState(null);
   const [from, setFrom] = useState(daysAgo(30));
   const [to, setTo] = useState(today());
+  const [period, setPeriod] = useState('30d');
   const [ref, setRef] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
@@ -27,12 +57,18 @@ export default function Admin({ user }) {
   async function load() {
     const range = `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
     const funnelRange = range + (ref.trim() ? `&ref=${encodeURIComponent(ref.trim())}` : '');
-    const [s, f, c, creators, hooks, links] = await Promise.all([
-      api('/admin/stats' + range), api('/admin/funnel' + funnelRange), api('/admin/campaigns'),
+    const [s, f, t, c, creators, hooks, links] = await Promise.all([
+      api('/admin/stats' + range), api('/admin/funnel' + funnelRange), api('/admin/trends' + range), api('/admin/campaigns'),
       api('/admin/creators'), api('/admin/hooks'), api('/admin/campaign-links'),
     ]);
-    setStats(s); setFunnel(f); setCampaigns(c.items || []);
+    setStats(s); setFunnel(f); setTrends(t.series || []); setCampaigns(c.items || []);
     setRecords({ creators: creators.items || [], hooks: hooks.items || [], 'campaign-links': links.items || [] });
+  }
+
+  function selectPeriod(value) {
+    const end = today();
+    const starts = { '7d': daysAgo(6), '30d': daysAgo(29), '90d': daysAgo(89), year: `${new Date().getUTCFullYear()}-01-01`, all: '2000-01-01' };
+    setPeriod(value); setFrom(starts[value]); setTo(end);
   }
 
   useEffect(() => {
@@ -81,10 +117,11 @@ export default function Admin({ user }) {
 
     {message && <p className="mb-4 text-sm text-zinc-600" role="status">{message}</p>}
     <section className="card mb-4 flex flex-wrap items-end gap-3">
-      <label className="text-sm">From<input className="input mt-1 block" type="date" value={from} max={to} onChange={(event) => setFrom(event.target.value)} /></label>
-      <label className="text-sm">To<input className="input mt-1 block" type="date" value={to} min={from} max={today()} onChange={(event) => setTo(event.target.value)} /></label>
+      <div className="flex flex-wrap gap-2" role="group" aria-label="Statistics period">{[['7d','7 days'],['30d','30 days'],['90d','90 days'],['year','This year'],['all','All time']].map(([value,label]) => <button key={value} type="button" className={`btn ${period === value ? 'btn-primary' : ''}`} onClick={() => selectPeriod(value)}>{label}</button>)}</div>
+      <label className="text-sm">From<input className="input mt-1 block" type="date" value={from} max={to} onChange={(event) => { setPeriod('custom'); setFrom(event.target.value); }} /></label>
+      <label className="text-sm">To<input className="input mt-1 block" type="date" value={to} min={from} max={today()} onChange={(event) => { setPeriod('custom'); setTo(event.target.value); }} /></label>
       <label className="text-sm">Referral code<input className="input mt-1 block" type="search" value={ref} placeholder="All sources" onChange={(event) => setRef(event.target.value)} /></label>
-      <span className="pb-2 text-sm text-zinc-500">Date range applies to dashboard and funnel. Referral code filters the funnel. Campaign totals are all-time.</span>
+      <span className="pb-2 text-sm text-zinc-500">Date range applies to dashboard, charts, and funnel. Campaign totals are all-time.</span>
     </section>
 
     <section className="admin-metrics">
@@ -94,6 +131,12 @@ export default function Admin({ user }) {
         ['Revenue', money(stats?.revenue)], ['MRR', money(stats?.mrr)],
         ['Active users · 7d', stats?.activeUsers], ['AI cost', money(stats?.aiCostEstimate)],
       ].map(([label, value]) => <article className="card" key={label}><span>{label}</span><strong>{value ?? '—'}</strong></article>)}
+    </section>
+
+    <section className="mt-6 grid gap-5 xl:grid-cols-2">
+      <TrendChart title="Visitors and registrations" series={trends} metrics={['visitors', 'signups']} />
+      <TrendChart title="Humanizer and purchase activity" series={trends} metrics={['humanized', 'purchaseClicks', 'paidUsers']} />
+      <TrendChart title="Revenue" series={trends} metrics={['revenue']} currency />
     </section>
 
     <section className="card mt-6">

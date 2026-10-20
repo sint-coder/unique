@@ -174,6 +174,28 @@ app.post('/api/billing/cancel', auth, async (req, res, next) => { try { const [s
 app.delete('/api/account', auth, async (req, res, next) => { try { const id=req.user.id,[s]=await query("SELECT * FROM subscriptions WHERE user_id=? AND status IN ('active','past_due','incomplete') AND cancel_at_period_end=0 ORDER BY current_period_end DESC LIMIT 1",[id]);if(s&&stripe)await stripe.subscriptions.update(s.provider_subscription_id,{cancel_at_period_end:true});await query('DELETE FROM sessions WHERE user_id=?',[id]);await query('DELETE FROM email_tokens WHERE user_id=?',[id]);await query('UPDATE humanize_requests SET input_text=NULL,output_text=NULL,deleted_at=COALESCE(deleted_at,UTC_TIMESTAMP()) WHERE user_id=?',[id]);await query("UPDATE users SET email=CONCAT('deleted_',id,'@invalid'),password_hash=NULL,google_sub=NULL,visitor_id=NULL,deleted_at=UTC_TIMESTAMP() WHERE id=?",[id]);res.append('Set-Cookie',`sid=; Path=/; ${cookieOptions}; Max-Age=0`).json({ok:true})}catch(e){next(e)} });
 
 app.get('/api/admin/stats', auth, admin, async (req,res,next)=>{try{const range=dateRange(req.query),[s]=await query("SELECT (SELECT COUNT(*) FROM users WHERE created_at BETWEEN ? AND ? AND deleted_at IS NULL) signups,(SELECT COUNT(DISTINCT user_id) FROM payments WHERE status='succeeded' AND created_at BETWEEN ? AND ?) paidUsers,(SELECT COUNT(*) FROM payments WHERE status='succeeded' AND created_at BETWEEN ? AND ?) revenue,(SELECT COALESCE(SUM(cost_micro_usd),0) FROM humanize_requests WHERE created_at BETWEEN ? AND ?) cost,(SELECT COUNT(*) FROM users u WHERE u.created_at BETWEEN ? AND ? AND u.deleted_at IS NULL AND EXISTS(SELECT 1 FROM payments p WHERE p.user_id=u.id AND p.status='succeeded')) convertedSignups",[...range,range[0],range[1]]),[m]=await query("SELECT COALESCE(SUM(monthly_amount_cents),0) n FROM subscriptions WHERE status='active' AND current_period_end>UTC_TIMESTAMP()"),[a]=await query("SELECT COUNT(DISTINCT user_id) n FROM humanize_requests WHERE status='completed' AND created_at>=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 7 DAY)");const signups=Number(s.signups),converted=Number(s.convertedSignups);res.json({...s,signups,paidUsers:Number(s.paidUsers),conversionRate:signups?converted/signups:0,revenue:Number(s.revenue)/100,mrr:Number(m.n)/100,activeUsers:Number(a.n),aiCostEstimate:Number(s.cost)/1e6});}catch(e){next(e)}});
+app.get('/api/admin/trends', auth, admin, async (req,res,next)=>{
+  try {
+    const [from,to]=dateRange(req.query), spanDays=Math.floor((Date.parse(`${to}T00:00:00Z`)-Date.parse(`${from}T00:00:00Z`))/86400000)+1;
+    const bucket=spanDays<=45?'day':spanDays<=180?'week':'month';
+    const period=bucket==='day'?'DATE(created_at)':bucket==='week'?'DATE_SUB(DATE(created_at), INTERVAL WEEKDAY(created_at) DAY)':"DATE_FORMAT(created_at,'%Y-%m-01')";
+    const [visitors,signups,humanized,clicks,payments]=await Promise.all([
+      query(`SELECT ${period} period,COUNT(DISTINCT vid) value FROM analytics_events WHERE created_at BETWEEN ? AND ? AND event='landing_view' AND vid IS NOT NULL GROUP BY period`,[from,to]),
+      query(`SELECT ${period} period,COUNT(*) value FROM users WHERE created_at BETWEEN ? AND ? AND deleted_at IS NULL GROUP BY period`,[from,to]),
+      query(`SELECT ${period} period,COUNT(DISTINCT user_id) value FROM humanize_requests WHERE created_at BETWEEN ? AND ? AND status='completed' GROUP BY period`,[from,to]),
+      query(`SELECT ${period} period,COUNT(DISTINCT COALESCE(CONCAT('v:',vid),CONCAT('u:',user_id))) value FROM analytics_events WHERE created_at BETWEEN ? AND ? AND event='purchase_clicked' GROUP BY period`,[from,to]),
+      query(`SELECT ${period} period,COUNT(DISTINCT user_id) paidUsers,COALESCE(SUM(amount_cents),0) revenue FROM payments WHERE created_at BETWEEN ? AND ? AND status='succeeded' GROUP BY period`,[from,to]),
+    ]);
+    const points=new Map(),keyOf=value=>value instanceof Date?value.toISOString().slice(0,10):String(value).slice(0,10);
+    for(const [rows,metric] of [[visitors,'visitors'],[signups,'signups'],[humanized,'humanized'],[clicks,'purchaseClicks']])for(const row of rows){const key=keyOf(row.period);points.set(key,{...(points.get(key)||{}),[metric]:Number(row.value)});}
+    for(const row of payments){const key=keyOf(row.period);points.set(key,{...(points.get(key)||{}),paidUsers:Number(row.paidUsers),revenue:Number(row.revenue)/100});}
+    const cursor=new Date(`${from}T00:00:00Z`),end=new Date(`${to}T00:00:00Z`);
+    if(bucket==='week')cursor.setUTCDate(cursor.getUTCDate()-((cursor.getUTCDay()+6)%7));else if(bucket==='month')cursor.setUTCDate(1);
+    const series=[];
+    while(cursor<=end){const key=cursor.toISOString().slice(0,10);series.push({date:key,visitors:0,signups:0,humanized:0,purchaseClicks:0,paidUsers:0,revenue:0,...points.get(key)});if(bucket==='day')cursor.setUTCDate(cursor.getUTCDate()+1);else if(bucket==='week')cursor.setUTCDate(cursor.getUTCDate()+7);else cursor.setUTCMonth(cursor.getUTCMonth()+1);}
+    res.json({bucket,series});
+  } catch(e) { next(e); }
+});
 app.get('/api/admin/funnel', auth, admin, async (req,res,next)=>{
   try {
     const [from,to]=dateRange(req.query),ref=String(req.query.ref||'').trim(),eventFilter=ref?' AND ref_code=?':'',eventParams=ref?[from,to,ref]:[from,to],userFilter=ref?' AND signup_ref_code=?':'',userParams=ref?[from,to,ref]:[from,to];
