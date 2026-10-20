@@ -1,0 +1,5 @@
+.env
+.env.local
+setup-local.sql
+node_modules/
+var/log/

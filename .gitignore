@@ -1,0 +1,15 @@
+/tools/
+/node_modules/
+/.pnpm-store/
+/dist/
+.env
+.env.local
+*.log
+/.idea/
+/.vscode/
+mariadb-*.msi
+mariadb-11.4.13-winx64.msi
+backend/setup-local.sql
+/vendor/
+/var/log/
+backend/var/log/
