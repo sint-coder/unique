@@ -6,18 +6,29 @@ import mysql from 'mysql2/promise';
 import Stripe from 'stripe';
 import nodemailer from 'nodemailer';
 import { OAuth2Client } from 'google-auth-library';
-import argon2 from 'argon2';
-import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { argon2Verify } from 'hash-wasm';
+import { createHash, createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const app = express();
 const port = Number(process.env.PORT || 8000);
 const frontendDir = resolve(dirname(fileURLToPath(import.meta.url)), '../dist');
+const scryptN = 32768, scryptR = 8, scryptP = 1, scryptKeyLength = 64;
 const dsn = Object.fromEntries((process.env.DB_DSN || '').replace(/^mysql:/, '').split(';').map(s => s.split('=').map(x => x.trim())).filter(x => x.length === 2));
 const pool = mysql.createPool({ host: dsn.host || process.env.DB_HOST || '127.0.0.1', port: Number(dsn.port || process.env.DB_PORT || 3306), database: dsn.dbname || process.env.DB_NAME || 'unique_write', user: process.env.DB_USER || 'unique_write', password: process.env.DB_PASS || '', waitForConnections: true, connectionLimit: 10, timezone: 'Z', decimalNumbers: true, charset: 'utf8mb4' });
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 const sha = value => createHash('sha256').update(value).digest('hex');
+const deriveScrypt = (password, salt) => new Promise((resolve, reject) => scryptCallback(password, salt, scryptKeyLength, { N: scryptN, r: scryptR, p: scryptP, maxmem: 64 * 1024 * 1024 }, (error, key) => error ? reject(error) : resolve(key)));
+async function hashPassword(password) { const salt = randomBytes(16); const key = await deriveScrypt(password, salt); return `scrypt$${scryptN}$${scryptR}$${scryptP}$${salt.toString('base64url')}$${key.toString('base64url')}`; }
+async function verifyPassword(encoded, password) {
+  if (encoded.startsWith('$argon2')) return argon2Verify({ password, hash: encoded });
+  const match = /^scrypt\$(\d+)\$(\d+)\$(\d+)\$([A-Za-z0-9_-]+)\$([A-Za-z0-9_-]+)$/.exec(encoded);
+  if (!match || Number(match[1]) !== scryptN || Number(match[2]) !== scryptR || Number(match[3]) !== scryptP) return false;
+  const salt = Buffer.from(match[4], 'base64url'), expected = Buffer.from(match[5], 'base64url');
+  if (salt.length !== 16 || expected.length !== scryptKeyLength) return false;
+  return timingSafeEqual(await deriveScrypt(password, salt), expected);
+}
 const words = text => (String(text).trim().match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu) || []).length;
 const query = async (sql, params = [], conn = pool) => { const [rows] = await conn.execute(sql, params); return rows; };
 function normalizeAttribution(input = {}) {
@@ -78,7 +89,7 @@ app.post('/api/auth/register', async (req, res, next) => {
     await rateHit(`register:daily:${req.ip}`,100,86400);
     if (!await rateHit(`register:${req.ip}`,5,3600)) throw fail(429,'RATE_LIMITED','Too many attempts. Please try again later.');
     if (['mailinator.com','10minutemail.com','tempmail.com','guerrillamail.com','yopmail.com','throwawaymail.com','temp-mail.org'].includes(email.split('@')[1])) throw fail(422, 'VALIDATION', 'Please use a non-disposable email address.');
-    const hash = await argon2.hash(password, { type: argon2.argon2id }), conn = await pool.getConnection(); let id;
+    const hash = await hashPassword(password), conn = await pool.getConnection(); let id;
     try {
       await conn.beginTransaction();
       const visitor = await saveVisitor(conn, req.body.attribution, req);
@@ -92,12 +103,12 @@ app.post('/api/auth/register', async (req, res, next) => {
     await setSession(res, req, id); res.json({ ok: true });
   } catch (e) { next(e); }
 });
-app.post('/api/auth/login', async (req, res, next) => { try { const email = String(req.body.email || '').trim().toLowerCase(),failureKey=`login:failure:${req.ip}`;if(await rateCount(failureKey)>=3&&process.env.TURNSTILE_SECRET&&!await captchaValid(req.body.turnstileToken,req.ip))throw fail(428,'CAPTCHA_REQUIRED','Please complete the security check.');if(!await rateHit(`login:${req.ip}:${email}`,5,900))throw fail(429,'RATE_LIMITED','Too many attempts. Please try again later.');const rows = await query('SELECT * FROM users WHERE email=? AND deleted_at IS NULL LIMIT 1', [email]); if (!rows[0]?.password_hash || !(await argon2.verify(rows[0].password_hash, String(req.body.password || '')))) {await rateHit(failureKey,100,86400);throw fail(401, 'UNAUTHENTICATED', 'Invalid email or password.');}await rateReset(failureKey);await setSession(res, req, rows[0].id); res.json({ ok: true }); } catch (e) { next(e); } });
+app.post('/api/auth/login', async (req, res, next) => { try { const email = String(req.body.email || '').trim().toLowerCase(), password = String(req.body.password || ''), failureKey=`login:failure:${req.ip}`;if(await rateCount(failureKey)>=3&&process.env.TURNSTILE_SECRET&&!await captchaValid(req.body.turnstileToken,req.ip))throw fail(428,'CAPTCHA_REQUIRED','Please complete the security check.');if(!await rateHit(`login:${req.ip}:${email}`,5,900))throw fail(429,'RATE_LIMITED','Too many attempts. Please try again later.');const rows = await query('SELECT * FROM users WHERE email=? AND deleted_at IS NULL LIMIT 1', [email]); const stored = rows[0]?.password_hash; if (!stored || !(await verifyPassword(stored, password))) {await rateHit(failureKey,100,86400);throw fail(401, 'UNAUTHENTICATED', 'Invalid email or password.');}if(stored.startsWith('$argon2'))await query('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?',[await hashPassword(password),rows[0].id,stored]);await rateReset(failureKey);await setSession(res, req, rows[0].id); res.json({ ok: true }); } catch (e) { next(e); } });
 app.post('/api/auth/logout', async (req, res, next) => { try { if (req.cookies.sid) await query('DELETE FROM sessions WHERE token_hash=?', [sha(req.cookies.sid)]); res.append('Set-Cookie', `sid=; Path=/; ${cookieOptions}; Max-Age=0`).json({ ok: true }); } catch (e) { next(e); } });
 app.get('/api/auth/me', auth, async (req, res, next) => { try { const [sub] = await query("SELECT plan FROM subscriptions WHERE user_id=? AND status IN ('active','past_due') ORDER BY current_period_end DESC LIMIT 1", [req.user.id]); res.json({ id: req.user.id, email: req.user.email, emailVerified: !!req.user.email_verified_at, wordsRemaining: await remaining(req.user.id), plan: sub?.plan || 'free', role: req.user.role }); } catch (e) { next(e); } });
 app.post('/api/auth/verify-email', async (req, res, next) => { try { const h = sha(String(req.body.token || '')), rows = await query("SELECT user_id FROM email_tokens WHERE token_hash=? AND kind='verify' AND used_at IS NULL AND expires_at>UTC_TIMESTAMP()", [h]); if (!rows[0]) throw fail(422, 'VALIDATION', 'This verification link is invalid or expired.'); await query('UPDATE users SET email_verified_at=COALESCE(email_verified_at,UTC_TIMESTAMP()) WHERE id=?', [rows[0].user_id]); await query('UPDATE email_tokens SET used_at=UTC_TIMESTAMP() WHERE token_hash=?', [h]); res.json({ ok: true }); } catch (e) { next(e); } });
 app.post('/api/auth/forgot-password', async (req, res, next) => { try { const email = String(req.body.email || '').trim().toLowerCase(), [u] = await query('SELECT id FROM users WHERE email=? AND deleted_at IS NULL', [email]); if (u) try { await issueToken(u.id, email, 'reset', 1); } catch (e) { console.error('email_send_failed', 'reset'); } res.json({ message: 'If that email exists, a reset link is on its way.' }); } catch (e) { next(e); } });
-app.post('/api/auth/reset-password', async (req, res, next) => { try { const token = String(req.body.token || ''), password = String(req.body.password || ''); if (password.length < 8 || password.length > 200) throw fail(422, 'VALIDATION', 'Password must be at least 8 characters.'); const h = sha(token), [r] = await query("SELECT user_id FROM email_tokens WHERE token_hash=? AND kind='reset' AND used_at IS NULL AND expires_at>UTC_TIMESTAMP()", [h]); if (!r) throw fail(422, 'VALIDATION', 'This reset link is invalid or expired.'); await query('UPDATE users SET password_hash=? WHERE id=?', [await argon2.hash(password, { type: argon2.argon2id }), r.user_id]); await query('DELETE FROM sessions WHERE user_id=?', [r.user_id]); await query('UPDATE email_tokens SET used_at=UTC_TIMESTAMP() WHERE token_hash=?', [h]); res.json({ ok: true }); } catch (e) { next(e); } });
+app.post('/api/auth/reset-password', async (req, res, next) => { try { const token = String(req.body.token || ''), password = String(req.body.password || ''); if (password.length < 8 || password.length > 200) throw fail(422, 'VALIDATION', 'Password must be at least 8 characters.'); const h = sha(token), [r] = await query("SELECT user_id FROM email_tokens WHERE token_hash=? AND kind='reset' AND used_at IS NULL AND expires_at>UTC_TIMESTAMP()", [h]); if (!r) throw fail(422, 'VALIDATION', 'This reset link is invalid or expired.'); await query('UPDATE users SET password_hash=? WHERE id=?', [await hashPassword(password), r.user_id]); await query('DELETE FROM sessions WHERE user_id=?', [r.user_id]); await query('UPDATE email_tokens SET used_at=UTC_TIMESTAMP() WHERE token_hash=?', [h]); res.json({ ok: true }); } catch (e) { next(e); } });
 app.get('/api/auth/google', (req, res, next) => { try { const client = oauthClient(), state = randomBytes(24).toString('hex'); const attrs = Object.fromEntries(['vid','ref','utm_source','utm_medium','utm_campaign','utm_content'].filter(k => req.query[k]).map(k => [k, String(req.query[k]).slice(0,160)])); res.append('Set-Cookie', `oauth_state=${state}; Path=/api/auth/google; Max-Age=600; ${cookieOptions}`).append('Set-Cookie', `oauth_attr=${Buffer.from(JSON.stringify(attrs)).toString('base64url')}; Path=/api/auth/google; Max-Age=600; ${cookieOptions}`).redirect(client.generateAuthUrl({ access_type: 'online', scope: ['openid','email','profile'], state })); } catch (e) { next(e); } });
 app.get('/api/auth/google/callback', async (req, res) => {
   try {
