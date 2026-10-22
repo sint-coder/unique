@@ -126,7 +126,8 @@ export default function Admin({ user }) {
 
     <section className="admin-metrics">
       {[
-        ['Signups', stats?.signups], ['Paying users', stats?.paidUsers],
+        ['Unique visitors · today', stats?.todayVisitors], ['Registrations · today', stats?.todaySignups],
+        ['Signups · selected period', stats?.signups], ['Paying users', stats?.paidUsers],
         ['Signup conversion', `${((stats?.conversionRate || 0) * 100).toFixed(1)}%`],
         ['Revenue', money(stats?.revenue)], ['MRR', money(stats?.mrr)],
         ['Active users · 7d', stats?.activeUsers], ['AI cost', money(stats?.aiCostEstimate)],
